@@ -2,8 +2,9 @@
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::generate;
-use landlock::RulesetError;
+use landlock::{path_beneath_rules, AccessFs, RulesetCreatedAttr, RulesetError};
 use landlockconfig::{BuildRulesetError, ParseDirectoryError, ResolveError, ResolvedConfig};
+use lddtree::{DependencyAnalyzer, DependencyTree};
 use std::{
     collections::BTreeMap,
     env,
@@ -89,6 +90,13 @@ enum Commands {
             help = "Execute command without sandboxing if no profile is found"
         )]
         ignore_missing_profile: bool,
+
+        #[arg(
+            long,
+            help = "Disable shared-library dependency resolution (lddtree)",
+            long_help = "Disable shared-library dependency resolution using lddtree. When set, Island will not automatically allow shared library dependencies; only the resolved command path will be allowed. Use this if your profile already grants the necessary access or if you want fully declarative dependency access rules."
+        )]
+        no_ldd: bool,
 
         #[arg(
             trailing_var_arg = true,
@@ -212,6 +220,128 @@ enum IslandError {
 
     #[error(transparent)]
     Ruleset(#[from] RulesetError),
+
+    #[error(transparent)]
+    LddTree(#[from] lddtree::Error),
+
+    #[error(transparent)]
+    WhichError(#[from] which::Error),
+}
+
+fn lddtree_collect_extra_library_paths(tree: &DependencyTree) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::<PathBuf>::new();
+
+    // Binary-level RPATH/RUNPATH.
+    for p in tree.runpath.iter().chain(tree.rpath.iter()) {
+        let pb = PathBuf::from(p);
+        if pb.is_absolute() {
+            paths.insert(pb);
+        }
+    }
+
+    for lib in tree.libraries.values() {
+        // Library-level RPATH/RUNPATH.
+        for p in lib.runpath.iter().chain(lib.rpath.iter()) {
+            let pb = PathBuf::from(p);
+            if pb.is_absolute() {
+                paths.insert(pb);
+            }
+        }
+
+        // Also add the directory of resolved libraries.
+        if let Some(realpath) = lib.realpath.as_ref() {
+            if let Some(parent) = realpath.parent() {
+                paths.insert(parent.to_path_buf());
+            }
+        } else if lib.path.is_absolute() {
+            if let Some(parent) = lib.path.parent() {
+                paths.insert(parent.to_path_buf());
+            }
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+fn resolve_dependency_tree(path: &Path) -> Result<DependencyTree, IslandError> {
+    // lddtree (crate) searches using the binary's RUNPATH/RPATH, but some ecosystems
+    // (notably Nix) rely heavily on library-level RUNPATH to find second-order deps.
+    // Work around this by iteratively re-analyzing with additional search paths
+    // derived from already-resolved libraries.
+    const MAX_PASSES: usize = 3;
+
+    /* Root is set to / to resolve dependencies globally. */
+    let mut tree = DependencyAnalyzer::new("/".into()).analyze(path)?;
+    let mut extra_paths: Vec<PathBuf> = Vec::new();
+
+    for _ in 0..MAX_PASSES {
+        if !tree.libraries.values().any(|lib| {
+            lib.realpath.is_none() && !lib.path.is_absolute() && !lib.path.as_os_str().is_empty()
+        }) {
+            break;
+        }
+
+        let newly_discovered = lddtree_collect_extra_library_paths(&tree);
+        let mut combined = std::collections::BTreeSet::<PathBuf>::new();
+        combined.extend(extra_paths.into_iter());
+        combined.extend(newly_discovered.into_iter());
+        extra_paths = combined.into_iter().collect();
+
+        let next_tree = DependencyAnalyzer::new("/".into())
+            .library_paths(extra_paths.clone())
+            .analyze(path)?;
+        // Stop early if we didn't make progress.
+        if next_tree
+            .libraries
+            .values()
+            .filter(|lib| lib.realpath.is_some())
+            .count()
+            <= tree
+                .libraries
+                .values()
+                .filter(|lib| lib.realpath.is_some())
+                .count()
+        {
+            tree = next_tree;
+            break;
+        }
+        tree = next_tree;
+    }
+
+    Ok(tree)
+}
+
+fn resolve_command_dependency_paths(
+    command_path: PathBuf,
+    no_ldd: bool,
+    verbose: &Verbose,
+) -> Result<Vec<PathBuf>, IslandError> {
+    let mut lddtree_paths: Vec<PathBuf> = vec![command_path.clone()];
+
+    if no_ldd {
+        verbose.print(|| "Skipping shared-library dependency resolution (--no-ldd)".to_string());
+        return Ok(lddtree_paths);
+    }
+
+    let dep_tree = resolve_dependency_tree(&command_path)?;
+    for (library_name, library_object) in &dep_tree.libraries {
+        // Use realpath if available (canonical resolved path), otherwise fall back to path.
+        // When a library isn't found, lddtree sets realpath to None and path to just the
+        // library name (not a full path).
+        if let Some(realpath) = &library_object.realpath {
+            lddtree_paths.push(realpath.clone());
+        } else if library_object.path.is_absolute() {
+            lddtree_paths.push(library_object.path.clone());
+        } else {
+            eprintln!(
+                "Warning: could not resolve library path for {}: {}",
+                library_name,
+                library_object.path.display()
+            );
+        }
+    }
+
+    Ok(lddtree_paths)
 }
 
 fn run(
@@ -219,6 +349,7 @@ fn run(
     island_config: &IslandConfig,
     command_args: &[String],
     ignore_missing_profile: bool,
+    no_ldd: bool,
     verbose: &Verbose,
 ) -> Result<(), IslandError> {
     verbose.print(|| {
@@ -257,6 +388,20 @@ fn run(
     let workspace_manager =
         last_profile.workspace_manager(island_config, verbose, |s| env::var(s))?;
 
+    // Resolve and allow shared library dependencies.
+    let absolute_command_path = if Path::new(&command_args[0]).is_absolute() {
+        PathBuf::from(&command_args[0])
+    } else {
+        which::which(&command_args[0])?
+    };
+    let command_path = try_canonicalize(absolute_command_path)?;
+    verbose.print(|| format!("Resolved command path: {}", command_path.display()));
+
+    let lddtree_paths = resolve_command_dependency_paths(command_path, no_ldd, verbose)?;
+    for path in &lddtree_paths {
+        verbose.print(|| format!("Allowing dependency path: {}", path.display()));
+    }
+
     // Apply each profile's restrictions in order (broadest scope first).
     for resolved_profile in resolved_profiles {
         let (mut ruleset, rule_errors) = resolved_profile.config.build_ruleset()?;
@@ -269,6 +414,13 @@ fn run(
         // restrictions - if any parent ruleset doesn't allow workspace access,
         // child rulesets can't grant it either.
         ruleset = workspace_manager.update_ruleset(ruleset, verbose)?;
+
+        // Add lddtree library paths to allow executing the command and its dependencies.
+        let lddtree_rules = path_beneath_rules(
+            lddtree_paths.iter().cloned(),
+            AccessFs::ReadFile | AccessFs::Execute,
+        );
+        ruleset = ruleset.add_rules(lddtree_rules)?;
 
         // TODO: Do not rely on the kernel to enforce nested sandboxing (limited to 16 layers).
         ruleset.restrict_self()?;
@@ -344,6 +496,7 @@ fn main() -> Result<(), IslandError> {
             profile,
             command,
             ignore_missing_profile,
+            no_ldd,
         } => {
             let island_config = IslandConfig::new(|s| std::env::var(s))?;
             let resolved_profiles = resolve_profiles(&island_config, &profile, &verbose)?;
@@ -353,6 +506,7 @@ fn main() -> Result<(), IslandError> {
                 &island_config,
                 &command,
                 ignore_missing_profile,
+                no_ldd,
                 &verbose,
             )
         }
